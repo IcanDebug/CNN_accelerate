@@ -1,0 +1,237 @@
+import sys
+sys.path.append("../..")
+from util.dataset import get_files
+
+from keras.models import Sequential, Model
+from keras.optimizers import SGD  
+from keras.layers import Dense, Dropout, Activation, Flatten, Input, concatenate, merge
+from keras.layers import Convolution2D, MaxPooling2D, AveragePooling2D, normalization, GlobalAveragePooling2D
+from keras.layers.convolutional import ZeroPadding2D
+from keras import backend as K
+
+def DenseNet121(nb_dense_block=4, growth_rate=32, nb_filter=64, reduction=0.0, dropout_rate=0.0, weight_decay=1e-4, classes=2, weights_path=None):
+    '''Instantiate the DenseNet 121 architecture,
+        # Arguments
+            nb_dense_block: number of dense blocks to add to end
+            growth_rate: number of filters to add per dense block
+            nb_filter: initial number of filters
+            reduction: reduction factor of transition blocks.
+            dropout_rate: dropout rate
+            weight_decay: weight decay factor
+            classes: optional number of classes to classify images
+            weights_path: path to pre-trained weights
+        # Returns
+            A Keras model instance.
+    '''
+    eps = 1.1e-5
+
+    # compute compression factor
+    compression = 1.0 - reduction
+
+    # Handle Dimension Ordering for different backends
+    global concat_axis
+    if K.image_dim_ordering() == 'tf':
+      concat_axis = 3
+      img_input = Input(shape=(224, 224, 3), name='data')
+    else:
+      concat_axis = 1
+      img_input = Input(shape=(3, 224, 224), name='data')
+
+    # From architecture for ImageNet (Table 1 in the paper)
+    nb_filter = 64
+    nb_layers = [6,12,24,16] # For DenseNet-121
+
+    # Initial convolution
+    x = ZeroPadding2D((3, 3), name='conv1_zeropadding')(img_input)
+    x = Convolution2D(nb_filter, 7, 7, subsample=(2, 2), name='conv1', bias=False)(x)
+    x = normalization.BatchNormalization(epsilon=eps, axis=concat_axis, scale=True, name='conv1_bn')(x)
+    #x = Scale(axis=concat_axis, name='conv1_scale')(x)
+    x = Activation('relu', name='relu1')(x)
+    x = ZeroPadding2D((1, 1), name='pool1_zeropadding')(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), name='pool1')(x)
+
+    # Add dense blocks
+    for block_idx in range(nb_dense_block - 1):
+        stage = block_idx+2
+        x, nb_filter = dense_block(x, stage, nb_layers[block_idx], nb_filter, growth_rate, dropout_rate=dropout_rate, weight_decay=weight_decay)
+
+        # Add transition_block
+        x = transition_block(x, stage, nb_filter, compression=compression, dropout_rate=dropout_rate, weight_decay=weight_decay)
+        nb_filter = int(nb_filter * compression)
+
+    final_stage = stage + 1
+    x, nb_filter = dense_block(x, final_stage, nb_layers[-1], nb_filter, growth_rate, dropout_rate=dropout_rate, weight_decay=weight_decay)
+
+    x = normalization.BatchNormalization(epsilon=eps, axis=concat_axis, scale=True, name='conv'+str(final_stage)+'_blk_bn')(x)
+    #x = Scale(axis=concat_axis, name='conv'+str(final_stage)+'_blk_scale')(x)
+    x = Activation('relu', name='relu'+str(final_stage)+'_blk')(x)
+    x = GlobalAveragePooling2D(name='pool'+str(final_stage))(x)
+
+    x = Dense(classes, name='fc6')(x)
+    x = Activation('softmax', name='prob')(x)
+
+    model = Model(img_input, x, name='densenet')
+
+    if weights_path is not None:
+      model.load_weights(weights_path)
+
+    return model
+
+
+def conv_block(x, stage, branch, nb_filter, dropout_rate=None, weight_decay=1e-4):
+    '''Apply BatchNorm, Relu, bottleneck 1x1 Conv2D, 3x3 Conv2D, and option dropout
+        # Arguments
+            x: input tensor 
+            stage: index for dense block
+            branch: layer index within each dense block
+            nb_filter: number of filters
+            dropout_rate: dropout rate
+            weight_decay: weight decay factor
+    '''
+    eps = 1.1e-5
+    conv_name_base = 'conv' + str(stage) + '_' + str(branch)
+    relu_name_base = 'relu' + str(stage) + '_' + str(branch)
+
+    # 1x1 Convolution (Bottleneck layer)
+    inter_channel = nb_filter * 4  
+    x = normalization.BatchNormalization(epsilon=eps, axis=concat_axis, scale=True, name=conv_name_base+'_x1_bn')(x)
+    #x = Scale(axis=concat_axis, name=conv_name_base+'_x1_scale')(x)
+    x = Activation('relu', name=relu_name_base+'_x1')(x)
+    x = Convolution2D(inter_channel, 1, 1, name=conv_name_base+'_x1', bias=False)(x)
+
+    if dropout_rate:
+        x = Dropout(dropout_rate)(x)
+
+    # 3x3 Convolution
+    x = normalization.BatchNormalization(epsilon=eps, axis=concat_axis, scale=True, name=conv_name_base+'_x2_bn')(x)
+    #x = Scale(axis=concat_axis, name=conv_name_base+'_x2_scale')(x)
+    x = Activation('relu', name=relu_name_base+'_x2')(x)
+    x = ZeroPadding2D((1, 1), name=conv_name_base+'_x2_zeropadding')(x)
+    x = Convolution2D(nb_filter, 3, 3, name=conv_name_base+'_x2', bias=False)(x)
+
+    if dropout_rate:
+        x = Dropout(dropout_rate)(x)
+
+    return x
+
+
+def transition_block(x, stage, nb_filter, compression=1.0, dropout_rate=None, weight_decay=1E-4):
+    ''' Apply BatchNorm, 1x1 Convolution, averagePooling, optional compression, dropout 
+        # Arguments
+            x: input tensor
+            stage: index for dense block
+            nb_filter: number of filters
+            compression: calculated as 1 - reduction. Reduces the number of feature maps in the transition block.
+            dropout_rate: dropout rate
+            weight_decay: weight decay factor
+    '''
+
+    eps = 1.1e-5
+    conv_name_base = 'conv' + str(stage) + '_blk'
+    relu_name_base = 'relu' + str(stage) + '_blk'
+    pool_name_base = 'pool' + str(stage) 
+
+    x = normalization.BatchNormalization(epsilon=eps, axis=concat_axis, scale=True, name=conv_name_base+'_bn')(x)
+    #x = Scale(axis=concat_axis, name=conv_name_base+'_scale')(x)
+    x = Activation('relu', name=relu_name_base)(x)
+    x = Convolution2D(int(nb_filter * compression), 1, 1, name=conv_name_base, bias=False)(x)
+
+    if dropout_rate:
+        x = Dropout(dropout_rate)(x)
+
+    x = AveragePooling2D((2, 2), strides=(2, 2), name=pool_name_base)(x)
+
+    return x
+
+
+def dense_block(x, stage, nb_layers, nb_filter, growth_rate, dropout_rate=None, weight_decay=1e-4, grow_nb_filters=True):
+    ''' Build a dense_block where the output of each conv_block is fed to subsequent ones
+        # Arguments
+            x: input tensor
+            stage: index for dense block
+            nb_layers: the number of layers of conv_block to append to the model.
+            nb_filter: number of filters
+            growth_rate: growth rate
+            dropout_rate: dropout rate
+            weight_decay: weight decay factor
+            grow_nb_filters: flag to decide to allow number of filters to grow
+    '''
+
+    eps = 1.1e-5
+    concat_feat = x
+
+    for i in range(nb_layers):
+        branch = i+1
+        x = conv_block(concat_feat, stage, branch, growth_rate, dropout_rate, weight_decay)
+        concat_feat = merge([concat_feat, x], mode='concat', concat_axis=concat_axis, name='concat_'+str(stage)+'_'+str(branch))
+
+        if grow_nb_filters:
+            nb_filter += growth_rate
+
+    return concat_feat, nb_filter
+
+def train_densenet(train, train_label):
+    from keras.callbacks import ReduceLROnPlateau, CSVLogger, TensorBoard
+    import matplotlib.pyplot as plt
+    
+    model = DenseNet121()
+    model.compile(loss="categorical_crossentropy",optimizer='sgd',metrics=['accuracy'])
+    #learnRate = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=10, verbose=0, mode='auto', epsilon=0.0001, cooldown=0, min_lr=0)
+    log = CSVLogger('result/log_epoch.csv', separator=',', append=False)
+    board = TensorBoard(log_dir='result/logs', histogram_freq=0, write_graph=True, write_images=False, embeddings_freq=0, embeddings_layer_names=None, embeddings_metadata=None)
+    history=model.fit(train, train_label, batch_size=100, epochs=20, validation_split=0.1, callbacks=[log,board])
+    
+    plt.plot()  
+    # summarize history for loss  
+    plt.plot(history.history['loss'])  
+    plt.plot(history.history['val_loss'])  
+    plt.title('model loss')  
+    plt.ylabel('loss')  
+    plt.xlabel('epoch')  
+    plt.legend(['train', 'test'], loc='upper left')  
+    plt.show()  
+    
+    model.save('densenet.h5')
+    
+def test_alexnet():
+    from keras.models import load_model
+    import numpy as np
+    import time
+
+    time_start=time.time()
+    test_dir= '/home/pdd/pdwork/CV_BiShe/picture/trainTest/'
+    test, test_label = get_files(test_dir, 224, 224)
+    TP = 0 
+    TN = 0
+    FP = 0
+    FN = 0
+    
+    model = load_model('densenet.h5')
+    test_result = model.predict(test)
+    time_end=time.time()
+    time_spent = time_end-time_start
+    print(time_spent)
+    
+    #calc precision and recall
+    
+    for i in range(0,len(test_label)):
+        if np.argmax(test_result[i]) == 1:
+            if np.argmax(test_label[i]) == 1:
+                TP += 1
+            else:
+                FP += 1
+        else:
+            if np.argmax(test_label[i]) == 1:
+                FN += 1
+            else:
+                TN += 1
+    precision = TP/(FP+TP)
+    recall    = TP/(FN+TP)
+    print('precision', precision)
+    print('recall', recall)
+    return time_spent, precision, recall
+
+
+train_dir ="/home/pdd/pdwork/CV_BiShe/picture/picTrain"
+train, train_label = get_files(train_dir, 224, 224)
+train_densenet(train, train_label)

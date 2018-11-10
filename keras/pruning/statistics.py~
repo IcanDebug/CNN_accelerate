@@ -1,0 +1,12 @@
+from keras.layers import Convolution2D
+
+
+
+def statistics_weight(model):
+    weights = {}
+    for layer in model.layers:
+        layer_weight = layer.get_weights()
+        if isinstance(layer, Convolution2D):
+            weights[layer.name+'/kernel'] = layer_weight[0]
+            weights[layer.name + '/bias'] = layer_weight[1]
+    return weights
